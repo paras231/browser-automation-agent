@@ -1,0 +1,27 @@
+[project]
+name = "browser-automation-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "paras231", email = "sharmaparas553@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "langchain>=1.4.3",
+    "langchain-ollama>=1.1.0",
+    "langgraph>=1.2.12",
+    "ollama>=0.6.3",
+    "pillow>=11.0.0",
+    "playwright>=1.63.0",
+    "pytesseract>=0.3.13",
+    "python-dotenv>=1.2.4",
+    "requests>=2.34.2",
+]
+
+[project.scripts]
+browser-automation-agent = "browser_automation_agent:main"
+
+[build-system]
+requires = ["uv_build>=0.12.7,<0.13.0"]
+build-backend = "uv_build"
