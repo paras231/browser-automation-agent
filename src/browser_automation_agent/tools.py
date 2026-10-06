@@ -141,7 +141,33 @@ async def observe_page(config: RunnableConfig = None):
         element = locator.nth(i)
 
         try:
-            if not await element.is_visible():
+            input_type = await element.get_attribute("type")
+            tag = await element.evaluate("(el) => el.tagName.toLowerCase()")
+            is_checkbox_like = tag == "input" and input_type in ("checkbox", "radio")
+
+            visible = await element.is_visible()
+
+            # Toggle/switch widgets (privacy, consent, marketing opt-in,
+            # etc.) are almost always a real <input type="checkbox">
+            # made visually invisible (opacity:0, sr-only, 1px, etc.) with
+            # a styled <span>/<div> drawn on top as the switch the user
+            # sees. A strict is_visible() check here used to drop that
+            # real input entirely, leaving the agent with no selector it
+            # could actually toggle - it would click the decorative span
+            # instead, which often has no handler at all. So: never skip
+            # a checkbox/radio input for invisibility, only for things
+            # that are genuinely not on the page (display:none AND
+            # zero-size, i.e. not just hidden-but-present).
+            if not visible and is_checkbox_like:
+                has_box = await element.evaluate(
+                    """(el) => {
+                        const r = el.getBoundingClientRect();
+                        return r.width > 0 || r.height > 0 || el.offsetParent !== null;
+                    }"""
+                )
+                if not has_box:
+                    continue
+            elif not visible:
                 continue
 
             # Tag the exact DOM node so the selector we hand back can
@@ -154,8 +180,6 @@ async def observe_page(config: RunnableConfig = None):
             )
 
             text = (await element.inner_text()).strip()
-            input_type = await element.get_attribute("type")
-            tag = await element.evaluate("(el) => el.tagName.toLowerCase()")
 
             checked = None
             if tag == "input" and input_type in ("checkbox", "radio"):
@@ -348,22 +372,62 @@ async def set_checkbox(selector: str, checked: bool = True, config: RunnableConf
     try:
         page = await get_page(_session_id(config))
         locator = page.locator(selector).first
-        await locator.wait_for(state="visible", timeout=10000)
+
+        # Use "attached" rather than "visible": toggle/consent checkboxes
+        # are routinely implemented as a real <input> made permanently,
+        # intentionally invisible (opacity:0 / sr-only / 1px) with a
+        # styled span drawn on top as the switch. Waiting for "visible"
+        # here would legitimately time out forever on that pattern even
+        # though the element is perfectly interactive.
+        await locator.wait_for(state="attached", timeout=10000)
 
         tag = await locator.evaluate("(el) => el.tagName.toLowerCase()")
         input_type = await locator.get_attribute("type")
 
         if tag == "input" and input_type in ("checkbox", "radio"):
-            await locator.set_checked(checked)
-            current = await locator.is_checked()
+            try:
+                # force=True skips Playwright's visibility/actionability
+                # checks - required for the hidden-native-input pattern
+                # above, which would otherwise fail actionability.
+                await locator.set_checked(checked, force=True)
+                current = await locator.is_checked()
+            except Exception:
+                current = None
+
+            if current != checked:
+                # Fallback for elements with zero bounding box (true
+                # display:none), where even a forced click has nothing to
+                # click at: set the DOM property and dispatch the events
+                # a real click would fire, so framework (React/Vue/etc.)
+                # onChange handlers still see the change.
+                await locator.evaluate(
+                    """(el, val) => {
+                        el.checked = val;
+                        el.dispatchEvent(new Event('click', { bubbles: true }));
+                        el.dispatchEvent(new Event('input', { bubbles: true }));
+                        el.dispatchEvent(new Event('change', { bubbles: true }));
+                    }""",
+                    checked
+                )
+                current = await locator.is_checked()
         else:
-            # Custom widget - toggle via click based on aria-checked, since
+            # Custom widget (e.g. role="switch" div with no backing
+            # <input>) - toggle via click based on aria-checked, since
             # Playwright's set_checked only understands native inputs.
             aria_checked = await locator.get_attribute("aria-checked")
             current = aria_checked == "true"
 
             if current != checked:
-                await locator.click()
+                try:
+                    await locator.click(force=True, timeout=5000)
+                except Exception:
+                    # Last resort: fire a synthetic click directly, which
+                    # works even on elements Playwright can't hit-test
+                    # (zero-size, covered, off-screen).
+                    await locator.evaluate(
+                        "(el) => el.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))"
+                    )
+
                 await page.wait_for_timeout(150)
                 aria_checked = await locator.get_attribute("aria-checked")
                 current = aria_checked == "true" if aria_checked is not None else checked
@@ -626,8 +690,25 @@ async def check_form_requirements(config: RunnableConfig = None):
             el = checkbox_locator.nth(i)
 
             try:
+                # Same hidden-native-input toggle pattern as observe_page -
+                # don't drop a checkbox/radio just because it's visually
+                # hidden behind a styled switch; only drop it if it truly
+                # has no box at all (not rendered anywhere on the page).
+                input_type_probe = await el.get_attribute("type")
+                is_checkbox_like = input_type_probe in ("checkbox", "radio")
+
                 if not await el.is_visible(timeout=300):
-                    continue
+                    if not is_checkbox_like:
+                        continue
+
+                    has_box = await el.evaluate(
+                        """(el) => {
+                            const r = el.getBoundingClientRect();
+                            return r.width > 0 || r.height > 0 || el.offsetParent !== null;
+                        }"""
+                    )
+                    if not has_box:
+                        continue
 
                 label_text = await el.evaluate(
                     """(el) => {

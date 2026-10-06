@@ -389,7 +389,7 @@ graph = worker_graph
 
 
 async def main():
-    task = "book flight tickets on makemytrip for 9 Oct Friday , from Jaipur to Mumbai."
+    task = "go to google and download drishyam3."
 
     print(await run_task(graph, task, thread_id="browser-automation-session"))
 
