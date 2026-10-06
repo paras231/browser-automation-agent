@@ -32,12 +32,10 @@ dependencies = [
     { name = "langchain" },
     { name = "langchain-ollama" },
     { name = "langgraph" },
-    { name = "ollama" },
     { name = "pillow" },
     { name = "playwright" },
     { name = "pytesseract" },
     { name = "python-dotenv" },
-    { name = "requests" },
 ]
 
 [package.metadata]
@@ -45,12 +43,10 @@ requires-dist = [
     { name = "langchain", specifier = ">=1.4.3" },
     { name = "langchain-ollama", specifier = ">=1.1.0" },
     { name = "langgraph", specifier = ">=1.2.12" },
-    { name = "ollama", specifier = ">=0.6.3" },
     { name = "pillow", specifier = ">=11.0.0" },
     { name = "playwright", specifier = ">=1.63.0" },
     { name = "pytesseract", specifier = ">=0.3.13" },
     { name = "python-dotenv", specifier = ">=1.2.4" },
-    { name = "requests", specifier = ">=2.34.2" },
 ]
 
 [[package]]
