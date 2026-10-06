@@ -1,3 +1,8 @@
+import asyncio
+import functools
+import json
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from langchain.tools import tool
 from langchain_core.runnables import RunnableConfig
@@ -17,6 +22,87 @@ except ImportError:
         DEFAULT_SESSION_ID,
     )
     import captcha as _captcha
+
+
+_LOG_PATH = Path("logs") / "tool_calls.log"
+
+
+def _log_tool_call(fn):
+    """Log every call to a tool: args (minus the RunnableConfig object,
+    which is noisy and not useful here), the session id, how long the
+    underlying Playwright call took, and what it returned - one line to
+    stdout and one JSON record appended to logs/tool_calls.log.
+
+    This replaces ad-hoc print() calls scattered in individual tools -
+    every tool gets the same record for free, with no per-tool code.
+    """
+
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        session_id = _session_id(kwargs.get("config"))
+        logged_args = {k: v for k, v in kwargs.items() if k != "config"}
+        started = time.monotonic()
+        status = "ok"
+        result = None
+
+        try:
+            result = await fn(*args, **kwargs)
+            return result
+        except Exception as e:
+            status = "exception"
+            result = {"error": str(e)}
+            raise
+        finally:
+            elapsed_ms = round((time.monotonic() - started) * 1000, 1)
+
+            print(
+                f"[tool] {fn.__name__} args={logged_args} "
+                f"-> {status} in {elapsed_ms}ms"
+            )
+
+            try:
+                _LOG_PATH.parent.mkdir(exist_ok=True)
+
+                with open(_LOG_PATH, "a") as f:
+                    f.write(json.dumps({
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "tool": fn.__name__,
+                        "session_id": session_id,
+                        "args": logged_args,
+                        "result": result,
+                        "status": status,
+                        "elapsed_ms": elapsed_ms,
+                    }, default=str) + "\n")
+            except Exception as log_error:
+                print(f"[tool] failed to write log entry: {log_error}")
+
+    return wrapper
+
+
+async def _with_retries(action, attempts: int = 3, base_delay: float = 0.4):
+    """Retry a flaky Playwright step (element not visible *yet*, a page
+    still animating/re-rendering, a brief navigation hiccup) before
+    surfacing a failure to the agent.
+
+    This is only for transient timing issues - it does not change outcome
+    for a genuinely wrong selector or a real validation error, which will
+    fail identically on every attempt and just return promptly. Keeping
+    this inside the tool (instead of relying on the LLM to notice a
+    failure and retry via another tool call) fixes the common flaky case
+    without spending an extra agent turn on it.
+    """
+    last_error = None
+
+    for attempt in range(attempts):
+        try:
+            return await action()
+        except Exception as e:
+            last_error = e
+
+            if attempt < attempts - 1:
+                await asyncio.sleep(base_delay * (2 ** attempt))
+
+    raise last_error
 
 
 def _session_id(config: RunnableConfig | None) -> str:
@@ -64,6 +150,7 @@ def request_human_input(prompt: str, input_type: str = "text") -> str:
 
 
 @tool
+@_log_tool_call
 async def grant_media_permissions(url: str | None = None, config: RunnableConfig = None):
     """Allow camera and microphone access for the current browser session.
 
@@ -97,13 +184,17 @@ async def grant_media_permissions(url: str | None = None, config: RunnableConfig
 
 
 @tool
+@_log_tool_call
 async def open_page(url: str, config: RunnableConfig = None):
     """Open a webpage."""
-
     try:
         page = await get_page(_session_id(config))
-        await page.goto(url)
-        await page.wait_for_load_state("domcontentloaded")
+
+        async def _goto():
+            await page.goto(url)
+            await page.wait_for_load_state("domcontentloaded")
+
+        await _with_retries(_goto)
 
         return {
             "success": True,
@@ -119,6 +210,7 @@ async def open_page(url: str, config: RunnableConfig = None):
 
 
 @tool
+@_log_tool_call
 async def observe_page(config: RunnableConfig = None):
     """List the visible, interactive elements on the current page.
 
@@ -239,15 +331,18 @@ async def observe_page(config: RunnableConfig = None):
 
 
 @tool
+@_log_tool_call
 async def click_element(selector: str, config: RunnableConfig = None):
     """Click an element. Use the exact "selector" value returned by observe_page."""
-
     try:
         page = await get_page(_session_id(config))
         locator = page.locator(selector).first
 
-        await locator.wait_for(state="visible", timeout=10000)
-        await locator.click()
+        async def _click():
+            await locator.wait_for(state="visible", timeout=10000)
+            await locator.click()
+
+        await _with_retries(_click)
 
         return {
             "success": True,
@@ -264,6 +359,7 @@ async def click_element(selector: str, config: RunnableConfig = None):
 
 
 @tool
+@_log_tool_call
 async def type_text(selector: str, text: str, config: RunnableConfig = None):
     """Type text into an input. Use the exact "selector" value returned by observe_page."""
 
@@ -271,8 +367,11 @@ async def type_text(selector: str, text: str, config: RunnableConfig = None):
         page = await get_page(_session_id(config))
         locator = page.locator(selector).first
 
-        await locator.wait_for(state="visible", timeout=10000)
-        await locator.fill(text)
+        async def _fill():
+            await locator.wait_for(state="visible", timeout=10000)
+            await locator.fill(text)
+
+        await _with_retries(_fill)
 
         return {
             "success": True,
@@ -289,6 +388,7 @@ async def type_text(selector: str, text: str, config: RunnableConfig = None):
 
 
 @tool
+@_log_tool_call
 async def press_key(key: str, selector: str | None = None, config: RunnableConfig = None):
     """Press a keyboard key, e.g. "Enter", "Tab", "Escape".
 
@@ -300,12 +400,15 @@ async def press_key(key: str, selector: str | None = None, config: RunnableConfi
     try:
         page = await get_page(_session_id(config))
 
-        if selector:
-            locator = page.locator(selector).first
-            await locator.wait_for(state="visible", timeout=10000)
-            await locator.press(key)
-        else:
-            await page.keyboard.press(key)
+        async def _press():
+            if selector:
+                locator = page.locator(selector).first
+                await locator.wait_for(state="visible", timeout=10000)
+                await locator.press(key)
+            else:
+                await page.keyboard.press(key)
+
+        await _with_retries(_press)
 
         return {
             "success": True,
@@ -321,6 +424,7 @@ async def press_key(key: str, selector: str | None = None, config: RunnableConfi
 
 
 @tool
+@_log_tool_call
 async def select_option(selector: str, value: str, config: RunnableConfig = None):
     """Choose an option in a <select> dropdown, by its visible label or value.
     Use the exact "selector" value returned by observe_page."""
@@ -329,12 +433,15 @@ async def select_option(selector: str, value: str, config: RunnableConfig = None
         page = await get_page(_session_id(config))
         locator = page.locator(selector).first
 
-        await locator.wait_for(state="visible", timeout=10000)
+        async def _select():
+            await locator.wait_for(state="visible", timeout=10000)
 
-        try:
-            await locator.select_option(label=value)
-        except Exception:
-            await locator.select_option(value=value)
+            try:
+                await locator.select_option(label=value)
+            except Exception:
+                await locator.select_option(value=value)
+
+        await _with_retries(_select)
 
         return {
             "success": True,
@@ -351,6 +458,7 @@ async def select_option(selector: str, value: str, config: RunnableConfig = None
 
 
 @tool
+@_log_tool_call
 async def set_checkbox(selector: str, checked: bool = True, config: RunnableConfig = None):
     """Set a checkbox/toggle (e.g. a consent, Terms & Conditions, or
     privacy-policy checkbox) to a specific checked state.
@@ -447,6 +555,7 @@ async def set_checkbox(selector: str, checked: bool = True, config: RunnableConf
 
 
 @tool
+@_log_tool_call
 async def fill_date(selector: str, date: str, config: RunnableConfig = None):
     """Set a date field, including JS date-picker widgets that reject
     plain typing/fill.
@@ -657,6 +766,7 @@ async def fill_date(selector: str, date: str, config: RunnableConfig = None):
 
 
 @tool
+@_log_tool_call
 async def check_form_requirements(config: RunnableConfig = None):
     """Scan the current page for a form's required consent/Terms &
     Conditions checkboxes and required fields that are not yet satisfied.
@@ -801,6 +911,7 @@ async def check_form_requirements(config: RunnableConfig = None):
 
 
 @tool
+@_log_tool_call
 async def submit_form(selector: str, config: RunnableConfig = None):
     """Click a form's submit button and verify the submission actually
     went through, instead of assuming a click = success.
@@ -824,11 +935,14 @@ async def submit_form(selector: str, config: RunnableConfig = None):
     try:
         page = await get_page(_session_id(config))
         locator = page.locator(selector).first
-        await locator.wait_for(state="visible", timeout=10000)
+
+        async def _click():
+            await locator.wait_for(state="visible", timeout=10000)
+            await locator.click()
 
         url_before = page.url
 
-        await locator.click()
+        await _with_retries(_click)
         await page.wait_for_timeout(1000)
 
         try:
@@ -882,6 +996,7 @@ async def submit_form(selector: str, config: RunnableConfig = None):
 
 
 @tool
+@_log_tool_call
 async def scroll_page(direction: str = "down", amount: int = 800, config: RunnableConfig = None):
     """Scroll the page. direction: "up", "down", "top", or "bottom".
 
@@ -916,6 +1031,7 @@ async def scroll_page(direction: str = "down", amount: int = 800, config: Runnab
 
 
 @tool
+@_log_tool_call
 async def go_back(config: RunnableConfig = None):
     """Navigate to the previous page in browser history."""
 
@@ -937,6 +1053,7 @@ async def go_back(config: RunnableConfig = None):
 
 
 @tool
+@_log_tool_call
 async def go_forward(config: RunnableConfig = None):
     """Navigate forward in browser history."""
 
@@ -958,6 +1075,7 @@ async def go_forward(config: RunnableConfig = None):
 
 
 @tool
+@_log_tool_call
 async def close_popup(config: RunnableConfig = None):
     """Detect and close a popup, modal dialog, cookie-consent banner,
     or overlay that is currently blocking the page.
@@ -1074,6 +1192,7 @@ async def close_popup(config: RunnableConfig = None):
 
 
 @tool
+@_log_tool_call
 async def extract_text(selector: str | None = None, config: RunnableConfig = None):
     """Read the visible text of the page, or of one element if a
     selector is given (use the exact value from observe_page).
@@ -1109,6 +1228,7 @@ async def extract_text(selector: str | None = None, config: RunnableConfig = Non
 
 
 @tool
+@_log_tool_call
 async def wait(seconds: float = 1.0, config: RunnableConfig = None):
     """Pause briefly (max 10s) to let dynamic content finish loading
     before the next action, e.g. after a search or an AJAX update."""
@@ -1131,6 +1251,7 @@ async def wait(seconds: float = 1.0, config: RunnableConfig = None):
 
 
 @tool
+@_log_tool_call
 async def solve_captcha(auto_fill: bool = True, config: RunnableConfig = None):
     """Detect and try to solve a CAPTCHA on the current page, for free,
     using local OCR - no paid service, no API key, no network call.
@@ -1204,6 +1325,113 @@ async def solve_captcha(auto_fill: bool = True, config: RunnableConfig = None):
 
 
 @tool
+@_log_tool_call
+async def list_frames_and_canvases(config: RunnableConfig = None):
+    """List <iframe> and <canvas> elements on the current page, each
+    with its on-screen bounding box.
+
+    Many embedded games/widgets (e.g. CrazyGames-style game embeds)
+    render inside an <iframe> containing a <canvas>, which exposes no
+    clickable DOM elements of its own - observe_page will never find
+    anything usable inside them. Call this tool to find the iframe/canvas
+    region on screen, then use click_at_coordinates with a point inside
+    the returned bounding box (e.g. its "center") to interact with it.
+    """
+
+    try:
+        page = await get_page(_session_id(config))
+        results = []
+
+        locator = page.locator("iframe, canvas")
+        count = await locator.count()
+
+        for i in range(count):
+            element = locator.nth(i)
+
+            try:
+                if not await element.is_visible():
+                    continue
+
+                box = await element.bounding_box()
+                if box is None:
+                    continue
+
+                tag = await element.evaluate("(el) => el.tagName.toLowerCase()")
+                tag_id = f"ba-frame-{i}"
+                await element.evaluate(
+                    "(el, id) => el.setAttribute('data-ba-id', id)", tag_id
+                )
+
+                results.append({
+                    "selector": f"[data-ba-id='{tag_id}']",
+                    "tag": tag,
+                    "src": await element.get_attribute("src") if tag == "iframe" else None,
+                    "bounding_box": box,
+                    "center": {
+                        "x": box["x"] + box["width"] / 2,
+                        "y": box["y"] + box["height"] / 2,
+                    },
+                })
+            except Exception:
+                continue
+
+        return {
+            "success": True,
+            "url": page.url,
+            "frames_and_canvases": results,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+
+@tool
+@_log_tool_call
+async def click_at_coordinates(
+    x: float, y: float, click_count: int = 1, config: RunnableConfig = None
+):
+    """Click at a specific pixel coordinate in the page viewport,
+    bypassing the DOM entirely.
+
+    Use this for canvas-rendered content (games, drawing apps, maps)
+    and anything inside an iframe that observe_page/click_element
+    cannot target because there is no clickable DOM element at that
+    spot - only pixels. Call list_frames_and_canvases first to find the
+    bounding box of the canvas/iframe, then pick a point inside it
+    (e.g. its "center") to pass here.
+
+    Args:
+        x: Horizontal pixel offset from the left edge of the viewport.
+        y: Vertical pixel offset from the top edge of the viewport.
+        click_count: Number of clicks to fire at this point - use 2 for
+            a double-click. Defaults to 1.
+    """
+
+    try:
+        page = await get_page(_session_id(config))
+        await page.mouse.click(x, y, click_count=click_count)
+
+        return {
+            "success": True,
+            "x": x,
+            "y": y,
+            "click_count": click_count,
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
+            "x": x,
+            "y": y,
+            "error": str(e)
+        }
+
+
+@tool
+@_log_tool_call
 async def take_screenshot(filename: str | None = None, config: RunnableConfig = None):
     """Take a screenshot of the current page.
 

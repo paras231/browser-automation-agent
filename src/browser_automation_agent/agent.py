@@ -36,6 +36,8 @@ try:
         request_human_input,
         grant_media_permissions,
         solve_captcha,
+        list_frames_and_canvases,
+        click_at_coordinates,
     )
     from .browser import new_session, close_session, DEFAULT_SESSION_ID
 except ImportError:
@@ -60,6 +62,8 @@ except ImportError:
         request_human_input,
         grant_media_permissions,
         solve_captcha,
+        list_frames_and_canvases,
+        click_at_coordinates,
     )
     from browser import new_session, close_session, DEFAULT_SESSION_ID
 
@@ -69,7 +73,7 @@ OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY")
 
 
 llm = ChatOllama(
-    model="gemma4:31b",
+    model="nemotron-3-ultra",
     base_url="https://ollama.com",
      client_kwargs={
         "headers": {
@@ -102,6 +106,12 @@ submit it, rather than guessing at a button selector.
 If the element you need is not in observe_page's results,
 it may be below the fold or not yet loaded - use scroll_page
 or wait before giving up.
+
+If you need to interact with a canvas-rendered widget (e.g. a
+game) or anything inside an iframe that observe_page finds no
+usable elements for, call list_frames_and_canvases to get its
+on-screen bounding box, then use click_at_coordinates with a
+point inside it (e.g. its "center") instead of click_element.
 
 Prefer extract_text over take_screenshot when you only need
 to read content (prices, confirmation text, results) - it is
@@ -262,6 +272,8 @@ WORKER_TOOLS = [
     request_human_input,
     grant_media_permissions,
     solve_captcha,
+    list_frames_and_canvases,
+    click_at_coordinates,
 ]
 
 worker_graph = _build_graph(WORKER_TOOLS)
@@ -389,7 +401,7 @@ graph = worker_graph
 
 
 async def main():
-    task = "go to google and download drishyam3."
+    task = "book a flight ticket from makemytrip from Jaipur to Mumbai 9 Oct Friday.exit once done."
 
     print(await run_task(graph, task, thread_id="browser-automation-session"))
 
