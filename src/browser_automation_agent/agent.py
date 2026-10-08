@@ -1,5 +1,6 @@
 import asyncio
 import uuid
+from datetime import datetime
 from typing import List, TypedDict
 from langchain.tools import tool
 from langchain_ollama import ChatOllama
@@ -38,6 +39,7 @@ try:
         solve_captcha,
         list_frames_and_canvases,
         click_at_coordinates,
+        download_file,
     )
     from .browser import new_session, close_session, DEFAULT_SESSION_ID
 except ImportError:
@@ -64,6 +66,7 @@ except ImportError:
         solve_captcha,
         list_frames_and_canvases,
         click_at_coordinates,
+        download_file,
     )
     from browser import new_session, close_session, DEFAULT_SESSION_ID
 
@@ -73,7 +76,7 @@ OLLAMA_API_KEY = os.environ.get("OLLAMA_API_KEY")
 
 
 llm = ChatOllama(
-    model="nemotron-3-ultra",
+    model="gemma4:31b",
     base_url="https://ollama.com",
      client_kwargs={
         "headers": {
@@ -89,7 +92,17 @@ class AgentState(TypedDict):
     messages: Annotated[list[BaseMessage], add_messages]
 
 
-WORKER_SYSTEM_PROMPT = """
+def _worker_system_prompt() -> str:
+    today = datetime.now().strftime("%Y-%m-%d (%A)")
+
+    return f"""
+Today's date is {today}. Resolve any relative or bare date in the
+task (e.g. "9 Oct", "next Friday", "tomorrow") against this date -
+never guess or assume a different year.
+""" + WORKER_SYSTEM_PROMPT_BODY
+
+
+WORKER_SYSTEM_PROMPT_BODY = """
 You are a browser automation agent.
 
 Use browser tools to accomplish the user's task.
@@ -112,6 +125,13 @@ game) or anything inside an iframe that observe_page finds no
 usable elements for, call list_frames_and_canvases to get its
 on-screen bounding box, then use click_at_coordinates with a
 point inside it (e.g. its "center") instead of click_element.
+
+To save a file (image, PDF, DOCX, ZIP, etc.) to disk, use
+download_file - pass `url` if you already know the file's
+direct link (e.g. an image "src" or a PDF "href"), or
+`selector` (from observe_page) to click a download button/link
+that triggers a browser download. Files are saved under
+downloads/.
 
 Prefer extract_text over take_screenshot when you only need
 to read content (prices, confirmation text, results) - it is
@@ -274,6 +294,7 @@ WORKER_TOOLS = [
     solve_captcha,
     list_frames_and_canvases,
     click_at_coordinates,
+    download_file,
 ]
 
 worker_graph = _build_graph(WORKER_TOOLS)
@@ -285,6 +306,7 @@ async def run_task(
     thread_id: str,
     session_id: str = DEFAULT_SESSION_ID,
     label: str = "",
+    is_subagent: bool = False,
 ) -> str:
     """Drive `graph` to completion on `task`, resolving human-input
     interrupts via blocking stdin reads (off the event loop), and return
@@ -299,11 +321,14 @@ async def run_task(
         "configurable": {
             "thread_id": thread_id,
             "session_id": session_id,
-        }
+        },
+        "run_name": label or f"worker: {task[:60]}",
+        "tags": ["subagent"] if is_subagent else ["worker"],
+        "metadata": {"task": task, "session_id": session_id},
     }
 
     messages = [
-        SystemMessage(content=WORKER_SYSTEM_PROMPT),
+        SystemMessage(content=_worker_system_prompt()),
         HumanMessage(content=task),
     ]
 
@@ -334,6 +359,7 @@ async def _run_subagent_task(task: str, index: int) -> dict:
             thread_id=f"subagent-{uuid.uuid4().hex}",
             session_id=session_id,
             label=f"sub-agent {index + 1}: {task[:40]}",
+            is_subagent=True,
         )
 
         return {"task": task, "success": True, "result": result}
@@ -401,7 +427,7 @@ graph = worker_graph
 
 
 async def main():
-    task = "book a flight ticket from makemytrip from Jaipur to Mumbai 9 Oct Friday.exit once done."
+    task = "go to pdfdrive and download a mathematics linear algebra book pdf"
 
     print(await run_task(graph, task, thread_id="browser-automation-session"))
 

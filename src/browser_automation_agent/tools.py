@@ -716,6 +716,25 @@ async def fill_date(selector: str, date: str, config: RunnableConfig = None):
             if not clicked:
                 break
 
+        if not matched:
+            # Never guess a day in whatever month happens to be showing -
+            # that would silently select the wrong date instead of
+            # reporting a clear failure the agent can act on (e.g. the
+            # target date is outside the picker's allowed range).
+            return {
+                "success": False,
+                "selector": selector,
+                "method": "calendar_popup",
+                "month_matched": False,
+                "day_clicked": False,
+                "error": (
+                    f"Could not navigate the calendar to {target_month_name} "
+                    f"{target_year} - it may be outside the range this "
+                    "picker allows (e.g. a past date, or too far in the "
+                    "future)."
+                ),
+            }
+
         day_str = str(target.day)
         day_candidates = popup.locator(
             f"[role='gridcell']:has-text('{day_str}'), "
@@ -750,10 +769,10 @@ async def fill_date(selector: str, date: str, config: RunnableConfig = None):
         await page.wait_for_timeout(200)
 
         return {
-            "success": matched and clicked_day,
+            "success": clicked_day,
             "selector": selector,
             "method": "calendar_popup",
-            "month_matched": matched,
+            "month_matched": True,
             "day_clicked": clicked_day,
         }
 
@@ -1426,6 +1445,140 @@ async def click_at_coordinates(
             "success": False,
             "x": x,
             "y": y,
+            "error": str(e)
+        }
+
+
+def _safe_filename(name: str) -> str:
+    """Strip any directory components from a server-/URL-suggested
+    filename before it's used to build a path - both download.suggested_filename
+    and a URL's basename are untrusted (attacker-controlled) strings, and
+    without this a name like "../../etc/passwd" would let a download
+    escape the downloads/ directory."""
+
+    return Path(name).name or "downloaded_file"
+
+
+@tool
+@_log_tool_call
+async def download_file(
+    url: str | None = None,
+    selector: str | None = None,
+    filename: str | None = None,
+    config: RunnableConfig = None,
+):
+    """Download a file (image, PDF, DOCX, ZIP, etc.) from the current
+    browser session to the local downloads/ directory.
+
+    Args:
+        url: Direct URL of the file to download (e.g. an image's "src",
+            a PDF link, a "raw file" link). Use this when you already
+            know the file's URL - e.g. an "href"/"src" seen via
+            observe_page or extract_text - and don't need to click
+            anything first.
+        selector: The exact "selector" value from observe_page for a
+            download link/button to click (e.g. a "Download" button
+            that triggers a browser download rather than linking
+            straight to a file). Use this instead of `url` when the
+            file has no plain URL you can fetch directly.
+        filename: Optional name to save the file as. If omitted, the
+            server-suggested filename (or the URL's basename) is used.
+
+    Exactly one of `url` or `selector` must be given.
+    """
+
+    if not url and not selector:
+        return {"success": False, "error": "Provide either url or selector."}
+
+    if url and selector:
+        return {
+            "success": False,
+            "error": "Provide only one of url or selector, not both."
+        }
+
+    try:
+        page = await get_page(_session_id(config))
+        downloads_dir = Path("downloads")
+        downloads_dir.mkdir(exist_ok=True)
+
+        download = None
+
+        if selector:
+            locator = page.locator(selector).first
+            await locator.wait_for(state="visible", timeout=10000)
+
+            async with page.expect_download(timeout=15000) as download_info:
+                await locator.click()
+
+            download = await download_info.value
+        else:
+            # Many direct file links (images, PDFs) don't fire a browser
+            # "download" event at all - the browser just navigates to /
+            # renders them inline. Try triggering a real download first
+            # (covers links the server marks Content-Disposition:
+            # attachment), then fall back to fetching the bytes directly.
+            try:
+                async with page.expect_download(timeout=8000) as download_info:
+                    await page.evaluate(
+                        """(u) => {
+                            const a = document.createElement('a');
+                            a.href = u;
+                            a.download = '';
+                            document.body.appendChild(a);
+                            a.click();
+                            a.remove();
+                        }""",
+                        url,
+                    )
+
+                download = await download_info.value
+            except Exception:
+                download = None
+
+        if download is not None:
+            save_name = _safe_filename(filename or download.suggested_filename)
+            filepath = downloads_dir / save_name
+            await download.save_as(str(filepath))
+
+            return {
+                "success": True,
+                "path": str(filepath),
+                "url": download.url,
+                "method": "browser_download",
+            }
+
+        # Fallback: fetch the bytes directly through the session's own
+        # request context (reuses cookies/auth already in the browser
+        # session for that origin).
+        response = await page.context.request.get(url)
+
+        if not response.ok:
+            return {
+                "success": False,
+                "error": f"HTTP {response.status} fetching {url}",
+            }
+
+        body = await response.body()
+
+        if not filename:
+            from urllib.parse import unquote, urlparse
+            filename = unquote(urlparse(url).path.rsplit("/", 1)[-1])
+
+        save_name = _safe_filename(filename)
+        filepath = downloads_dir / save_name
+        filepath.write_bytes(body)
+
+        return {
+            "success": True,
+            "path": str(filepath),
+            "url": url,
+            "method": "direct_fetch",
+            "content_type": response.headers.get("content-type"),
+        }
+
+    except Exception as e:
+        return {
+            "success": False,
             "error": str(e)
         }
 
