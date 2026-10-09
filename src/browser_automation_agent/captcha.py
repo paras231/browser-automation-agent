@@ -11,6 +11,15 @@ automated solving (that's their whole job), and there is no legitimate
 free way to defeat them - any such trick is an anti-abuse bypass, not a
 CAPTCHA "solver". detect_captcha still recognizes them so the agent can
 immediately fall back to request_human_input instead of getting stuck.
+
+Cloudflare Turnstile's "verify you are human" widget is different: in
+its default (non-interactive) mode it is just a checkbox a real visitor
+clicks to confirm a browser is present, and clicking it is the designed
+interaction, not a bypass of anything (the same category as ticking a
+cookie-consent box). This module clicks that checkbox and waits for the
+widget to report success. If Cloudflare escalates to a harder
+interactive puzzle, that part still can't be solved locally and falls
+back the same way reCAPTCHA/hCaptcha do.
 """
 
 import asyncio
@@ -100,6 +109,26 @@ async def detect_captcha(page: Page) -> dict | None:
     if hcaptcha and hcaptcha.get("sitekey"):
         return {"type": "hcaptcha", "sitekey": hcaptcha["sitekey"], "solvable_locally": False}
 
+    turnstile = await page.evaluate(
+        """() => {
+            const el = document.querySelector(
+                '.cf-turnstile[data-sitekey], div[data-sitekey][class*="turnstile" i]'
+            );
+            const iframe = document.querySelector(
+                "iframe[src*='challenges.cloudflare.com']"
+            );
+            if (el || iframe) return { sitekey: el ? el.dataset.sitekey : null };
+            return null;
+        }"""
+    )
+
+    if turnstile is not None:
+        return {
+            "type": "turnstile",
+            "sitekey": turnstile.get("sitekey"),
+            "solvable_locally": True,
+        }
+
     image_selector = (
         "img[src*='captcha' i], img[alt*='captcha' i], "
         "canvas[id*='captcha' i], img[id*='captcha' i]"
@@ -115,6 +144,76 @@ async def detect_captcha(page: Page) -> dict | None:
     return None
 
 
+async def _solve_turnstile(page: Page) -> dict:
+    """Click Cloudflare Turnstile's "verify you are human" checkbox and
+    wait for the widget to report success (a populated
+    cf-turnstile-response token). The widget itself lives inside an
+    iframe from challenges.cloudflare.com, and the checkbox inside that
+    is sometimes rendered in a further nested frame, so a few selector
+    strategies are tried."""
+
+    widget_frame = page.frame_locator("iframe[src*='challenges.cloudflare.com']").first
+
+    checkbox_candidates = [
+        widget_frame.locator("input[type='checkbox']"),
+        widget_frame.frame_locator("iframe").first.locator("input[type='checkbox']"),
+        widget_frame.get_by_role("checkbox"),
+        widget_frame.locator("label"),
+    ]
+
+    clicked = False
+    for candidate in checkbox_candidates:
+        try:
+            await candidate.first.click(timeout=4000)
+            clicked = True
+            break
+        except Exception:
+            continue
+
+    if not clicked:
+        try:
+            box = await page.locator(
+                "iframe[src*='challenges.cloudflare.com']"
+            ).first.bounding_box()
+            if box:
+                await page.mouse.click(
+                    box["x"] + 30, box["y"] + box["height"] / 2
+                )
+                clicked = True
+        except Exception:
+            pass
+
+    if not clicked:
+        return {
+            "solved": False,
+            "reason": (
+                "Could not locate the Turnstile checkbox to click. Ask the "
+                "human for help instead (request_human_input)."
+            ),
+        }
+
+    try:
+        await page.wait_for_function(
+            """() => {
+                const el = document.querySelector('[name="cf-turnstile-response"]');
+                return !!(el && el.value);
+            }""",
+            timeout=10000,
+        )
+        return {"solved": True, "answer": "checkbox_verified"}
+    except Exception:
+        return {
+            "solved": False,
+            "reason": (
+                "Clicked the Turnstile checkbox but it did not pass "
+                "automatically - Cloudflare likely escalated to an "
+                "interactive puzzle challenge, which can't be solved "
+                "locally. Ask the human for help instead "
+                "(request_human_input)."
+            ),
+        }
+
+
 async def solve(page: Page, captcha: dict) -> dict:
     """Attempt to solve a CAPTCHA previously found by detect_captcha.
 
@@ -123,6 +222,9 @@ async def solve(page: Page, captcha: dict) -> dict:
     why - the caller should fall back to request_human_input."""
 
     captcha_type = captcha["type"]
+
+    if captcha_type == "turnstile":
+        return await _solve_turnstile(page)
 
     if not captcha.get("solvable_locally"):
         return {

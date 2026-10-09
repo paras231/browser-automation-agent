@@ -9,7 +9,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.prebuilt import ToolNode
 from typing import Annotated
 from langgraph.graph.message import add_messages
-from langchain_core.messages import BaseMessage, ToolMessage
+from langchain_core.messages import BaseMessage, ToolMessage, AIMessage
 from langgraph.types import Command
 from langgraph.checkpoint.memory import MemorySaver
 import os
@@ -40,8 +40,14 @@ try:
         list_frames_and_canvases,
         click_at_coordinates,
         download_file,
+        inspect_element,
+        get_console_logs,
+        get_network_requests,
+        switch_devtools_tab,
+        diagnose_page_issue,
     )
     from .browser import new_session, close_session, DEFAULT_SESSION_ID
+    from .guardrails import check_request_safety
 except ImportError:
     from tools import (
         open_page,
@@ -67,8 +73,14 @@ except ImportError:
         list_frames_and_canvases,
         click_at_coordinates,
         download_file,
+        inspect_element,
+        get_console_logs,
+        get_network_requests,
+        switch_devtools_tab,
+        diagnose_page_issue,
     )
     from browser import new_session, close_session, DEFAULT_SESSION_ID
+    from guardrails import check_request_safety
 
 load_dotenv()
 
@@ -184,8 +196,11 @@ confirms it.
 If you encounter a CAPTCHA, call solve_captcha first. It can
 solve plain text/number image captchas for free using local
 OCR and will tell you if it filled the answer in for you. It
-cannot solve reCAPTCHA or hCaptcha (nothing free legitimately
-can) - when it reports one of those, or if it fails to solve
+also handles Cloudflare Turnstile's "verify you are human"
+checkbox by clicking it directly. It cannot solve reCAPTCHA or
+hCaptcha (nothing free legitimately can), nor a Turnstile
+challenge that escalates past the checkbox into an interactive
+puzzle - when it reports one of those, or if it fails to solve
 an image captcha, immediately call request_human_input instead
 of retrying it yourself.
 
@@ -197,6 +212,45 @@ request_human_input with a clear question instead of guessing,
 making one up, or giving up. Wait for the returned value, then
 use it (e.g. type_text it into the right field) and continue
 the task.
+
+DEBUGGING A BROKEN PAGE - use this when something doesn't work as
+expected (a blank section, a button that does nothing, missing or
+stale content, a layout glitch, or any mismatch between what the
+task expects and what the page actually does):
+- Call diagnose_page_issue (pass the element's selector if you've
+  already spotted which one looks broken). It gathers, in one call,
+  a screenshot of the current page, recent JS console
+  errors/warnings and uncaught exceptions, failed/erroring network
+  requests, and - if a selector was given - that element's HTML,
+  computed styles, and on-screen box. It does not decide what's
+  wrong for you; it only collects the evidence.
+- Review everything it returned together to work out the actual
+  root cause: a console error naming a null/undefined property or a
+  failed fetch usually explains a feature that silently does
+  nothing; a failed_request with a 4xx/5xx status or a network
+  failure reason explains missing/stale data; an element whose
+  computed_style shows display:none/visibility:hidden/opacity:0/a
+  zero-size bounding box when it should be visible, or a position
+  overlapped by something else, explains a "missing" or
+  mis-rendered element.
+- Then explain the root cause and give clear, step-by-step
+  instructions for how to fix it (e.g. "the signup button's click
+  handler throws TypeError: Cannot read properties of null (reading
+  'value') at line X because it reads #email before the field
+  exists in the DOM - move the handler so it runs after the form
+  renders, or null-check the element first"). You cannot edit the
+  site's code yourself, so your job here is an accurate diagnosis
+  and fix instructions, not applying the fix.
+- You can also open one devtools-style panel at a time directly:
+  inspect_element (Elements tab, one element's HTML/styles/box),
+  get_console_logs (Console tab), get_network_requests (Network
+  tab), or switch_devtools_tab (pass tab="elements"/"console"/
+  "network"/"sources" to open any one panel, matching how a human
+  switches tabs in a real browser's "Inspect Element" devtools
+  window). Prefer diagnose_page_issue first since it gathers all of
+  this at once; use these individually only when you need to re-check
+  one specific panel (e.g. re-reading console logs after retrying an
+  action).
 
 Once you have completed the user's task (or if you get
 stuck and cannot proceed further), call take_screenshot
@@ -212,6 +266,35 @@ def _make_tool_node_and_llm(tool_list):
 
 def _build_graph(tool_list):
     tool_node, llm_with_tools = _make_tool_node_and_llm(tool_list)
+
+    def guardrail_node(state: AgentState):
+        last_human = next(
+            (m for m in reversed(state["messages"]) if isinstance(m, HumanMessage)),
+            None,
+        )
+        task_text = last_human.content if last_human else ""
+
+        is_safe, reason = check_request_safety(llm, task_text)
+
+        if is_safe:
+            return {"messages": []}
+
+        return {
+            "messages": [
+                AIMessage(
+                    content=f"Request blocked by security guardrail: {reason}",
+                    name="guardrail_block",
+                )
+            ]
+        }
+
+    def guardrail_passed(state: AgentState):
+        last_message = state["messages"][-1] if state["messages"] else None
+
+        if isinstance(last_message, AIMessage) and last_message.name == "guardrail_block":
+            return END
+
+        return "agent"
 
     def agent_node(state: AgentState):
         response = llm_with_tools.invoke(state["messages"])
@@ -249,11 +332,21 @@ def _build_graph(tool_list):
 
     graph_builder = StateGraph(AgentState)
 
+    graph_builder.add_node("guardrail", guardrail_node)
     graph_builder.add_node("agent", agent_node)
     graph_builder.add_node("tools", tool_node)
     graph_builder.add_node("screenshot", final_screenshot)
 
-    graph_builder.add_edge(START, "agent")
+    graph_builder.add_edge(START, "guardrail")
+
+    graph_builder.add_conditional_edges(
+        "guardrail",
+        guardrail_passed,
+        {
+            "agent": "agent",
+            END: END,
+        }
+    )
 
     graph_builder.add_conditional_edges(
         "agent",
@@ -295,6 +388,11 @@ WORKER_TOOLS = [
     list_frames_and_canvases,
     click_at_coordinates,
     download_file,
+    inspect_element,
+    get_console_logs,
+    get_network_requests,
+    switch_devtools_tab,
+    diagnose_page_issue,
 ]
 
 worker_graph = _build_graph(WORKER_TOOLS)
@@ -427,7 +525,7 @@ graph = worker_graph
 
 
 async def main():
-    task = "go to pdfdrive and download a mathematics linear algebra book pdf"
+    task = "open langchain docs switch to dark mode and scrape the first page information."
 
     print(await run_task(graph, task, thread_id="browser-automation-session"))
 

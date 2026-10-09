@@ -12,6 +12,12 @@ try:
     from .browser import (
         get_page,
         grant_media_permissions as _grant_media_permissions,
+        get_console_logs as _get_console_logs,
+        get_page_errors as _get_page_errors,
+        get_network_entries as _get_network_entries,
+        clear_console_logs as _clear_console_logs,
+        clear_network_entries as _clear_network_entries,
+        clear_page_errors as _clear_page_errors,
         DEFAULT_SESSION_ID,
     )
     from . import captcha as _captcha
@@ -19,6 +25,12 @@ except ImportError:
     from browser import (
         get_page,
         grant_media_permissions as _grant_media_permissions,
+        get_console_logs as _get_console_logs,
+        get_page_errors as _get_page_errors,
+        get_network_entries as _get_network_entries,
+        clear_console_logs as _clear_console_logs,
+        clear_network_entries as _clear_network_entries,
+        clear_page_errors as _clear_page_errors,
         DEFAULT_SESSION_ID,
     )
     import captcha as _captcha
@@ -1273,20 +1285,27 @@ async def wait(seconds: float = 1.0, config: RunnableConfig = None):
 @_log_tool_call
 async def solve_captcha(auto_fill: bool = True, config: RunnableConfig = None):
     """Detect and try to solve a CAPTCHA on the current page, for free,
-    using local OCR - no paid service, no API key, no network call.
+    with no paid service, API key, or external network call.
 
-    Only works for plain text/number image CAPTCHAs (the common kind
-    used on login/signup/contact forms). reCAPTCHA and hCaptcha are
-    built specifically to resist automated solving, so this tool cannot
-    solve those - when it detects one of those instead, call
-    request_human_input to get a human past it rather than retrying
-    this tool.
+    Handles two kinds:
+    - Plain text/number image CAPTCHAs (the common kind used on
+      login/signup/contact forms) - solved with local OCR.
+    - Cloudflare Turnstile's "verify you are human" checkbox - solved by
+      clicking the checkbox itself, the same action a real visitor would
+      take.
+
+    reCAPTCHA and hCaptcha are built specifically to resist automated
+    solving, so this tool cannot solve those - when it detects one of
+    those instead, call request_human_input to get a human past it
+    rather than retrying this tool. The same applies if Turnstile
+    escalates to a harder interactive puzzle after the checkbox click.
 
     Args:
         auto_fill: If True (default) and an image captcha is solved,
             also type the answer into the nearest text input next to
             the captcha image. Set False to just return the answer
-            and fill it yourself with type_text.
+            and fill it yourself with type_text. Has no effect for the
+            Turnstile checkbox case.
     """
 
     try:
@@ -1314,7 +1333,7 @@ async def solve_captcha(auto_fill: bool = True, config: RunnableConfig = None):
         answer = result["answer"]
         filled_selector = None
 
-        if auto_fill:
+        if auto_fill and detected["type"] == "image":
             image_locator = page.locator(detected["selector"]).first
             input_locator = image_locator.locator(
                 "xpath=following::input[1]"
@@ -1583,6 +1602,43 @@ async def download_file(
         }
 
 
+async def _capture_screenshot(
+    session_id: str, filename: str | None = None, selector: str | None = None
+) -> dict:
+    """Shared screenshot logic used by both the take_screenshot tool and
+    diagnose_page_issue, so the "issue screenshot" the diagnosis tool
+    attaches is produced the exact same way a manually-requested one is.
+    """
+
+    page = await get_page(session_id)
+    await page.wait_for_load_state("domcontentloaded")
+    await page.wait_for_selector("body")
+
+    screenshot_dir = Path("screenshots")
+    screenshot_dir.mkdir(exist_ok=True)
+
+    if filename is None:
+        filename = f"page_{session_id[:8]}.png"
+
+    if not Path(filename).suffix:
+        filename += ".png"
+
+    filepath = screenshot_dir / filename
+
+    if selector:
+        locator = page.locator(selector).first
+        await locator.wait_for(state="attached", timeout=10000)
+        await locator.screenshot(path=str(filepath))
+    else:
+        await page.screenshot(path=str(filepath), full_page=True)
+
+    return {
+        "success": True,
+        "path": str(filepath),
+        "url": page.url
+    }
+
+
 @tool
 @_log_tool_call
 async def take_screenshot(filename: str | None = None, config: RunnableConfig = None):
@@ -1596,35 +1652,341 @@ async def take_screenshot(filename: str | None = None, config: RunnableConfig = 
     """
 
     try:
-        session_id = _session_id(config)
-        page = await get_page(session_id)
-        await page.wait_for_load_state("domcontentloaded")
-        await page.wait_for_selector("body")
-
-        screenshot_dir = Path("screenshots")
-        screenshot_dir.mkdir(exist_ok=True)
-
-        if filename is None:
-            filename = f"page_{session_id[:8]}.png"
-
-        if not Path(filename).suffix:
-            filename += ".png"
-
-        filepath = screenshot_dir / filename
-
-        await page.screenshot(
-            path=str(filepath),
-            full_page=True
-        )
-
-        return {
-            "success": True,
-            "path": str(filepath),
-            "url": page.url
-        }
+        return await _capture_screenshot(_session_id(config), filename)
 
     except Exception as e:
         return {
             "success": False,
             "error": str(e)
         }
+
+
+async def _inspect_element(selector: str, session_id: str) -> dict:
+    """Elements-panel-style inspection of one DOM element: its HTML,
+    attributes, computed styles, and on-screen box - shared by the
+    inspect_element tool and diagnose_page_issue."""
+
+    page = await get_page(session_id)
+    locator = page.locator(selector).first
+    await locator.wait_for(state="attached", timeout=10000)
+
+    data = await locator.evaluate(
+        """(el) => {
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+            const attributes = {};
+            for (const attr of el.attributes) attributes[attr.name] = attr.value;
+
+            return {
+                tag: el.tagName.toLowerCase(),
+                outer_html: el.outerHTML.slice(0, 2000),
+                attributes: attributes,
+                bounding_box: {
+                    x: rect.x, y: rect.y, width: rect.width, height: rect.height
+                },
+                in_viewport: (
+                    rect.bottom > 0 && rect.top < window.innerHeight &&
+                    rect.right > 0 && rect.left < window.innerWidth
+                ),
+                computed_style: {
+                    display: style.display,
+                    visibility: style.visibility,
+                    opacity: style.opacity,
+                    position: style.position,
+                    zIndex: style.zIndex,
+                    color: style.color,
+                    backgroundColor: style.backgroundColor,
+                    fontSize: style.fontSize,
+                    overflow: style.overflow,
+                    pointerEvents: style.pointerEvents,
+                },
+            };
+        }"""
+    )
+
+    return {"success": True, "selector": selector, **data}
+
+
+@tool
+@_log_tool_call
+async def inspect_element(selector: str, config: RunnableConfig = None):
+    """DevTools "Elements" tab equivalent: inspect one DOM element in
+    detail - its HTML, attributes, computed CSS styles, and on-screen
+    bounding box - the same information right-clicking an element and
+    choosing "Inspect" would show in a real browser's devtools.
+
+    Use this to diagnose a visual/layout bug: an element that looks
+    missing (display:none / visibility:hidden / opacity:0 / zero-size
+    when it shouldn't be), mispositioned, off-screen, the wrong
+    color, or covered by something else (check z-index/position
+    against overlapping elements).
+
+    Args:
+        selector: The exact "selector" value from observe_page, or any
+            valid CSS selector - the element does not need to be
+            interactive.
+    """
+
+    try:
+        return await _inspect_element(selector, _session_id(config))
+
+    except Exception as e:
+        return {"success": False, "selector": selector, "error": str(e)}
+
+
+@tool
+@_log_tool_call
+async def get_console_logs(
+    level: str | None = None, clear: bool = False, config: RunnableConfig = None
+):
+    """DevTools "Console" tab equivalent: read JavaScript console
+    messages logged by the current page - console.log/info/warn/error
+    calls, plus uncaught exceptions - since the session started (or
+    since this was last cleared).
+
+    Use this to find the root cause of a broken feature: a JS error
+    here (e.g. "TypeError: Cannot read properties of null", a failed
+    fetch, a React warning) is usually exactly why a button does
+    nothing, a form won't submit, or content fails to render.
+
+    Args:
+        level: Only return messages of this type, e.g. "error" or
+            "warning". Omit to get everything, including plain "log".
+        clear: If True, empty the buffer after reading it, so a
+            subsequent call only returns messages logged after this
+            point (useful right before retrying an action you suspect
+            is failing, to isolate just its errors).
+    """
+
+    try:
+        session_id = _session_id(config)
+        await get_page(session_id)
+
+        logs = list(_get_console_logs(session_id))
+
+        for err in _get_page_errors(session_id):
+            logs.append({
+                "level": "error",
+                "text": err["message"],
+                "location": None,
+                "timestamp": err["timestamp"],
+            })
+
+        logs.sort(key=lambda e: e["timestamp"])
+
+        if level:
+            logs = [entry for entry in logs if entry["level"] == level]
+
+        if clear:
+            _clear_console_logs(session_id)
+            _clear_page_errors(session_id)
+
+        return {"success": True, "count": len(logs), "logs": logs[-100:]}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@tool
+@_log_tool_call
+async def get_network_requests(
+    only_failed: bool = False,
+    resource_type: str | None = None,
+    clear: bool = False,
+    config: RunnableConfig = None,
+):
+    """DevTools "Network" tab equivalent: list HTTP requests the current
+    page has made (documents, XHR/fetch API calls, scripts, images,
+    stylesheets, etc.) since the session started (or since this was
+    last cleared), each with its method, status code, and failure
+    reason if it failed outright (e.g. CORS, DNS, connection refused).
+
+    Use only_failed=True to jump straight to the requests breaking the
+    page's functionality - a failed API call is often why a page shows
+    stale/empty data or a spinner that never resolves.
+
+    Args:
+        only_failed: Only return requests that failed at the network
+            level or came back with an HTTP error status (>= 400).
+        resource_type: Only return requests of this type, e.g.
+            "xhr", "fetch", "script", "image", "stylesheet", "document".
+        clear: If True, empty the buffer after reading it.
+    """
+
+    try:
+        session_id = _session_id(config)
+        await get_page(session_id)
+
+        entries = _get_network_entries(session_id)
+
+        if resource_type:
+            entries = [e for e in entries if e["resource_type"] == resource_type]
+
+        if only_failed:
+            entries = [
+                e for e in entries
+                if e["ok"] is False or (e["status"] is not None and e["status"] >= 400)
+            ]
+
+        if clear:
+            _clear_network_entries(session_id)
+
+        return {"success": True, "count": len(entries), "requests": entries[-100:]}
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@tool
+@_log_tool_call
+async def switch_devtools_tab(
+    tab: str,
+    selector: str | None = None,
+    only_failed: bool = False,
+    config: RunnableConfig = None,
+):
+    """Open a specific DevTools-style panel on the current page, exactly
+    like clicking between tabs in a real browser's "Inspect Element"
+    devtools window.
+
+    Args:
+        tab: Which panel to open - one of:
+            "elements" - inspect one DOM element (requires `selector`).
+            "console" - recent console messages and JS errors.
+            "network" - recent HTTP requests (pass only_failed=True to
+                see just the broken ones).
+            "sources" - the page's current URL, title, and raw
+                document HTML, to compare what's actually rendered
+                against what's expected.
+        selector: Required when tab="elements" - the exact "selector"
+            from observe_page, or any CSS selector, for the element to
+            inspect.
+        only_failed: Used only when tab="network" - only return
+            failed/error requests.
+    """
+
+    tab = tab.strip().lower()
+    session_id = _session_id(config)
+
+    try:
+        if tab == "elements":
+            if not selector:
+                return {
+                    "success": False,
+                    "error": "selector is required when tab='elements'",
+                }
+            return await _inspect_element(selector, session_id)
+
+        if tab == "console":
+            return await get_console_logs.ainvoke(
+                {}, config=config
+            )
+
+        if tab == "network":
+            return await get_network_requests.ainvoke(
+                {"only_failed": only_failed}, config=config
+            )
+
+        if tab == "sources":
+            page = await get_page(session_id)
+            html = await page.content()
+
+            return {
+                "success": True,
+                "tab": "sources",
+                "url": page.url,
+                "title": await page.title(),
+                "html": html[:5000],
+                "truncated": len(html) > 5000,
+            }
+
+        return {
+            "success": False,
+            "error": f"Unknown tab {tab!r} - use elements/console/network/sources",
+        }
+
+    except Exception as e:
+        return {"success": False, "tab": tab, "error": str(e)}
+
+
+@tool
+@_log_tool_call
+async def diagnose_page_issue(selector: str | None = None, config: RunnableConfig = None):
+    """Investigate a bug on the current page the way a developer would
+    with browser devtools open: capture a screenshot of the problem,
+    pull recent JS console errors/warnings and uncaught exceptions,
+    pull failed/erroring network requests, and (if you already know
+    which element looks broken) inspect that element's HTML/styles/box.
+
+    This does NOT fix anything by itself or decide what's wrong for
+    you - it only gathers the evidence. After calling it, look at
+    everything it returned together (screenshot + console_errors +
+    failed_requests + element, if any) to work out the actual root
+    cause yourself, then explain it and give the human clear,
+    step-by-step instructions for how to fix it.
+
+    Call this whenever something on the page looks broken: a blank
+    section, a button that does nothing, missing content, a layout
+    glitch, stale data, or any behavior that doesn't match what the
+    task expects.
+
+    Args:
+        selector: Optional - the exact "selector" from observe_page (or
+            any CSS selector) for the specific element that looks
+            broken, if you've already spotted one. Omit if the issue
+            isn't localized to one element.
+    """
+
+    try:
+        session_id = _session_id(config)
+        timestamp = int(time.time())
+        screenshot_filename = f"issue_{session_id[:8]}_{timestamp}.png"
+
+        screenshot = await _capture_screenshot(session_id, screenshot_filename)
+
+        console_logs = list(_get_console_logs(session_id))
+        for err in _get_page_errors(session_id):
+            console_logs.append({
+                "level": "error",
+                "text": err["message"],
+                "location": None,
+                "timestamp": err["timestamp"],
+            })
+        console_logs.sort(key=lambda e: e["timestamp"])
+        console_errors = [
+            entry for entry in console_logs if entry["level"] in ("error", "warning")
+        ]
+
+        network_entries = _get_network_entries(session_id)
+        failed_requests = [
+            e for e in network_entries
+            if e["ok"] is False or (e["status"] is not None and e["status"] >= 400)
+        ]
+
+        element = None
+        if selector:
+            try:
+                element = await _inspect_element(selector, session_id)
+            except Exception as e:
+                element = {"success": False, "selector": selector, "error": str(e)}
+
+        page = await get_page(session_id)
+
+        return {
+            "success": True,
+            "url": page.url,
+            "title": await page.title(),
+            "screenshot": screenshot,
+            "console_errors": console_errors[-50:],
+            "failed_requests": failed_requests[-50:],
+            "element": element,
+            "message": (
+                "Evidence gathered. Review the screenshot, console_errors, "
+                "failed_requests, and element (if given) together to "
+                "identify the root cause, then explain it and give "
+                "step-by-step instructions to fix it."
+            ),
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
